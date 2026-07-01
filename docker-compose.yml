@@ -1,0 +1,23 @@
+# docker-compose.yml
+#
+# For LOCAL testing only - lets you run the daily pipeline or the
+# closing-line loop in a container on your own machine before deploying
+# to Railway/Render. Railway does not use this file directly - it builds
+# the Dockerfile itself and you set start commands in its dashboard (see
+# README "Deploying to Railway" section).
+#
+# Usage:
+#   docker compose run --rm daily          # run the daily pipeline once
+#   docker compose up closing-lines         # run the closing-line loop continuously
+
+services:
+  daily:
+    build: .
+    env_file: .env
+    command: python run_daily.py
+
+  closing-lines:
+    build: .
+    env_file: .env
+    command: python closing_lines_loop.py
+    restart: unless-stopped
