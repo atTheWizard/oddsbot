@@ -141,12 +141,14 @@ def run():
                 league_avg_away_goals=league_avg_away_goals,
             )
 
-            insert_prediction(cur, fixture["fixture_id"], "home", prediction.prob_home_win,
-                               prediction.expected_goals_home, prediction.expected_goals_away)
-            insert_prediction(cur, fixture["fixture_id"], "draw", prediction.prob_draw,
-                               prediction.expected_goals_home, prediction.expected_goals_away)
-            insert_prediction(cur, fixture["fixture_id"], "away", prediction.prob_away_win,
-                               prediction.expected_goals_home, prediction.expected_goals_away)
+            eg_home = float(prediction.expected_goals_home)
+            eg_away = float(prediction.expected_goals_away)
+            insert_prediction(cur, fixture["fixture_id"], "home", float(prediction.prob_home_win),
+                               eg_home, eg_away)
+            insert_prediction(cur, fixture["fixture_id"], "draw", float(prediction.prob_draw),
+                               eg_home, eg_away)
+            insert_prediction(cur, fixture["fixture_id"], "away", float(prediction.prob_away_win),
+                               eg_home, eg_away)
 
     print(f"[{datetime.now()}] Scoring complete.")
 
