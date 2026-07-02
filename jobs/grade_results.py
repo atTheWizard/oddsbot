@@ -17,7 +17,7 @@ Run manually with: python -m jobs.grade_results
 import requests
 from datetime import datetime
 
-from config import ODDS_API_KEY, ODDS_API_BASE_URL, ODDS_API_SPORT
+from config import ODDS_API_KEY, ODDS_API_BASE_URL, ODDS_API_SPORTS
 from db.connection import get_cursor
 
 
