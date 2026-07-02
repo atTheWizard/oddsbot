@@ -103,7 +103,7 @@ def insert_prediction(cur, fixture_id: int, outcome: str, probability: float,
         VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         """,
-        (fixture_id, outcome, probability, expected_goals_home, expected_goals_away),
+        (fixture_id, outcome, float(probability), float(expected_goals_home), float(expected_goals_away)),
     )
 
 
