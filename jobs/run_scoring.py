@@ -1,36 +1,30 @@
 """
 jobs/run_scoring.py
 
-Scheduled job (run once daily). For every upcoming, not-yet-finished
-fixture: computes team strengths from match history, runs the Poisson
-model, and writes the resulting home/draw/away probabilities into
+Scheduled job (run once daily). For every upcoming fixture kicking off
+within the next 3 days: computes team strengths from match history, runs
+the Poisson model, and writes home/draw/away probabilities into
 model_predictions.
 
-IMPORTANT (look-ahead bias): get_team_match_history() below only pulls
-fixtures with kickoff_time BEFORE the fixture being predicted, and only
-ones that are already 'finished' with goals recorded. This is the
-guardrail discussed in the system design that protects any future
-backtest from accidentally letting the model see the future.
+Two guards against bad picks:
+1. Only scores fixtures within 3 days - ignores far-future fixtures that
+   have no business being picked today.
+2. Skips any fixture where either team has fewer than MIN_MATCH_SAMPLE_SIZE
+   finished matches in the database - neutral 1.0/1.0 strength ratings
+   produce fake EV and should never reach the picks selector.
 
 Run manually with: python -m jobs.run_scoring
 """
 
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from config import RECENCY_DECAY, MIN_MATCH_SAMPLE_SIZE
 from db.connection import get_cursor
 from model.team_strength import compute_team_strength, MatchRecord
 from model.poisson_model import predict_match
-from model.team_strength import TeamStrength
 
 
 def get_league_averages(cur, league: str) -> tuple[float, float]:
-    """
-    Computes league-wide average home/away goals from finished matches
-    in this league. Falls back to generic soccer defaults (1.5/1.2) if
-    there isn't enough finished-match data yet for this league - this
-    matters early on, before you've accumulated history.
-    """
     cur.execute(
         """
         SELECT AVG(home_goals) as avg_home, AVG(away_goals) as avg_away
@@ -47,17 +41,12 @@ def get_league_averages(cur, league: str) -> tuple[float, float]:
 
 def get_team_match_history(cur, team_id: int, before_kickoff: datetime, limit: int = 10) -> list[MatchRecord]:
     """
-    Pulls a team's most recent finished matches BEFORE before_kickoff,
-    as both home and away, and converts them into MatchRecord objects
-    with games_ago computed relative to recency.
-
-    The strict "before_kickoff" filter and "status = finished" filter
-    together are what prevent look-ahead bias - see module docstring.
+    Pulls a team's most recent finished matches BEFORE before_kickoff.
+    Strict 'before_kickoff' + 'finished' filters prevent look-ahead bias.
     """
     cur.execute(
         """
         SELECT
-            kickoff_time,
             CASE WHEN home_team_id = %(team_id)s THEN home_goals ELSE away_goals END as goals_for,
             CASE WHEN home_team_id = %(team_id)s THEN away_goals ELSE home_goals END as goals_against,
             (home_team_id = %(team_id)s) as was_home
@@ -72,49 +61,66 @@ def get_team_match_history(cur, team_id: int, before_kickoff: datetime, limit: i
     )
     rows = cur.fetchall()
 
-    history = []
-    for games_ago, row in enumerate(rows):
-        history.append(MatchRecord(
+    return [
+        MatchRecord(
             goals_for=row["goals_for"],
             goals_against=row["goals_against"],
             was_home=row["was_home"],
-            games_ago=games_ago,
-        ))
-    return history
+            games_ago=i,
+        )
+        for i, row in enumerate(rows)
+    ]
 
 
-def get_upcoming_fixtures(cur) -> list[dict]:
-    """Fixtures that haven't kicked off yet and haven't been scored yet today."""
+def get_upcoming_fixtures(cur, days_ahead: int = 3) -> list[dict]:
+    """
+    Only returns fixtures kicking off within the next `days_ahead` days.
+    This prevents the model from scoring August fixtures in July with
+    neutral team strengths and producing fake high-EV picks.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(days=days_ahead)
+
     cur.execute(
         """
         SELECT fixture_id, home_team_id, away_team_id, league, kickoff_time
         FROM fixtures
-        WHERE status = 'scheduled' AND kickoff_time > now()
-        """
+        WHERE status = 'scheduled'
+          AND kickoff_time > %(now)s
+          AND kickoff_time <= %(cutoff)s
+        """,
+        {"now": now, "cutoff": cutoff},
     )
     return cur.fetchall()
 
 
 def insert_prediction(cur, fixture_id: int, outcome: str, probability: float,
-                       expected_goals_home: float, expected_goals_away: float):
+                      expected_goals_home: float, expected_goals_away: float):
     cur.execute(
         """
         INSERT INTO model_predictions
             (fixture_id, outcome, model_probability, expected_goals_home, expected_goals_away)
         VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
         """,
         (fixture_id, outcome, probability, expected_goals_home, expected_goals_away),
     )
 
 
 def run():
-    print(f"[{datetime.now()}] Starting scoring job...")
+    print(f"[{datetime.now()}] Starting scoring job (fixtures within next 3 days only)...")
 
     with get_cursor(commit=True) as cur:
-        fixtures = get_upcoming_fixtures(cur)
-        print(f"Found {len(fixtures)} upcoming fixtures to score.")
+        fixtures = get_upcoming_fixtures(cur, days_ahead=3)
+        print(f"Found {len(fixtures)} fixtures within the next 3 days.")
+
+        if not fixtures:
+            print("No fixtures to score today. This is normal during off-season or mid-week.")
+            return
 
         league_avg_cache: dict[str, tuple[float, float]] = {}
+        scored = 0
+        skipped_no_history = 0
 
         for fixture in fixtures:
             league = fixture["league"]
@@ -122,8 +128,19 @@ def run():
                 league_avg_cache[league] = get_league_averages(cur, league)
             league_avg_home_goals, league_avg_away_goals = league_avg_cache[league]
 
-            home_history = get_team_match_history(cur, fixture["home_team_id"], fixture["kickoff_time"])
-            away_history = get_team_match_history(cur, fixture["away_team_id"], fixture["kickoff_time"])
+            home_history = get_team_match_history(
+                cur, fixture["home_team_id"], fixture["kickoff_time"]
+            )
+            away_history = get_team_match_history(
+                cur, fixture["away_team_id"], fixture["kickoff_time"]
+            )
+
+            # GUARD: skip fixture if either team has insufficient history.
+            # Neutral 1.0/1.0 strength ratings produce fake EV - these
+            # fixtures should never reach the picks selector.
+            if len(home_history) < MIN_MATCH_SAMPLE_SIZE or len(away_history) < MIN_MATCH_SAMPLE_SIZE:
+                skipped_no_history += 1
+                continue
 
             home_strength = compute_team_strength(
                 home_history, league_avg_home_goals, league_avg_away_goals,
@@ -141,14 +158,20 @@ def run():
                 league_avg_away_goals=league_avg_away_goals,
             )
 
-            eg_home = float(prediction.expected_goals_home)
-            eg_away = float(prediction.expected_goals_away)
-            insert_prediction(cur, fixture["fixture_id"], "home", float(prediction.prob_home_win),
-                               eg_home, eg_away)
-            insert_prediction(cur, fixture["fixture_id"], "draw", float(prediction.prob_draw),
-                               eg_home, eg_away)
-            insert_prediction(cur, fixture["fixture_id"], "away", float(prediction.prob_away_win),
-                               eg_home, eg_away)
+            insert_prediction(cur, fixture["fixture_id"], "home",
+                              prediction.prob_home_win, prediction.expected_goals_home,
+                              prediction.expected_goals_away)
+            insert_prediction(cur, fixture["fixture_id"], "draw",
+                              prediction.prob_draw, prediction.expected_goals_home,
+                              prediction.expected_goals_away)
+            insert_prediction(cur, fixture["fixture_id"], "away",
+                              prediction.prob_away_win, prediction.expected_goals_home,
+                              prediction.expected_goals_away)
+            scored += 1
+
+        print(f"Scored: {scored} fixtures")
+        if skipped_no_history:
+            print(f"Skipped: {skipped_no_history} fixtures (insufficient team history)")
 
     print(f"[{datetime.now()}] Scoring complete.")
 
