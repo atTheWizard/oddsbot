@@ -26,7 +26,7 @@ def fetch_results_from_api() -> list[dict]:
     Calls the odds API's scores endpoint for completed matches.
     Adjust parsing here if using a different provider than the-odds-api.com.
     """
-    url = f"{ODDS_API_BASE_URL}/sports/{ODDS_API_SPORT}/scores"
+    url = f"{ODDS_API_BASE_URL}/sports/{ODDS_API_SPORTS}/scores"
     params = {"apiKey": ODDS_API_KEY, "daysFrom": 3}
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
